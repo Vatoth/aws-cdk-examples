@@ -1,6 +1,5 @@
 import * as cdk from "aws-cdk-lib";
 import * as codebuild from "aws-cdk-lib/aws-codebuild";
-import * as codecommit from "aws-cdk-lib/aws-codecommit";
 import * as codedeploy from "aws-cdk-lib/aws-codedeploy";
 import * as pipeline from "aws-cdk-lib/aws-codepipeline";
 import * as pipelineactions from "aws-cdk-lib/aws-codepipeline-actions";
@@ -9,110 +8,131 @@ import * as ecr from "aws-cdk-lib/aws-ecr";
 import * as ecs from "aws-cdk-lib/aws-ecs";
 import * as elb from "aws-cdk-lib/aws-elasticloadbalancingv2";
 import * as iam from "aws-cdk-lib/aws-iam";
-import * as lambda from "aws-cdk-lib/aws-lambda";
-import * as assets from "aws-cdk-lib/aws-s3-assets";
+import * as s3 from "aws-cdk-lib/aws-s3";
 import * as custom from "aws-cdk-lib/custom-resources";
 import { Construct } from "constructs";
-import * as path from "path";
+import { CodeDeployEcsDeployActionRegion } from "./deploy-multi-region";
 
 export class CodepipelineBuildDeployStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Creates an AWS CodeCommit repository
-    const codeRepo = new codecommit.Repository(this, "codeRepo", {
-      repositoryName: "simple-app-code-repo",
-      // Copies files from ./app directory to the repo as the initial commit
-      code: codecommit.Code.fromDirectory(
-        path.join(__dirname, "../app"),
-        "main"
-      ),
+    // Creates an Elastic Container Registry (ECR) image repository
+    const imageRepo = new ecr.Repository(this, "imageRepo", {});
+    new ecr.CfnReplicationConfiguration(this, "imageRepoReplication", {
+      replicationConfiguration: {
+        rules: [
+          {
+            destinations: [
+              {
+                region: "us-east-1",
+                registryId: this.account,
+              },
+            ],
+          },
+        ],
+      },
     });
 
-    // Creates an Elastic Container Registry (ECR) image repository
-    const imageRepo = new ecr.Repository(this, "imageRepo");
+    // Creates new pipeline artifacts
+    const sourceArtifact = new pipeline.Artifact("SourceArtifact");
 
     // Creates a Task Definition for the ECS Fargate service
     const fargateTaskDef = new ecs.FargateTaskDefinition(
       this,
-      "FargateTaskDef"
+      "FargateTaskDef",
+      {
+        family: "codedeploy-sample",
+      }
     );
     fargateTaskDef.addContainer("container", {
       containerName: "web",
       image: ecs.ContainerImage.fromEcrRepository(imageRepo),
       portMappings: [{ containerPort: 80 }],
+      environment: {
+        NODE_ENV: "production",
+        QUEUE_URL: "https://sqs.us-east-1.amazonaws.com/123456789012/queue",
+      },
     });
 
     // CodeBuild project that builds the Docker image
     const buildImage = new codebuild.Project(this, "BuildImage", {
-      buildSpec: codebuild.BuildSpec.fromSourceFilename("buildspec.yaml"),
-      source: codebuild.Source.codeCommit({ repository: codeRepo }),
+      buildSpec: codebuild.BuildSpec.fromSourceFilename(
+        "typescript/codepipeline-build-deploy/app/buildspec.yaml"
+      ),
+      source: codebuild.Source.gitHub({
+        owner: "Vatoth",
+        repo: "aws-cdk-examples",
+      }),
       environment: {
         privileged: true,
         environmentVariables: {
           AWS_ACCOUNT_ID: { value: process.env?.CDK_DEFAULT_ACCOUNT || "" },
           REGION: { value: process.env?.CDK_DEFAULT_REGION || "" },
-          IMAGE_TAG: { value: "latest" },
           IMAGE_REPO_NAME: { value: imageRepo.repositoryName },
           REPOSITORY_URI: { value: imageRepo.repositoryUri },
           TASK_DEFINITION_ARN: { value: fargateTaskDef.taskDefinitionArn },
+          TASK_DEFINITION_NAME: { value: fargateTaskDef.family },
           TASK_ROLE_ARN: { value: fargateTaskDef.taskRole.roleArn },
           EXECUTION_ROLE_ARN: { value: fargateTaskDef.executionRole?.roleArn },
         },
       },
+      role: new iam.Role(this, "CodeBuildRole", {
+        assumedBy: new iam.ServicePrincipal("codebuild.amazonaws.com"),
+        inlinePolicies: {
+          ECRPolicy: new iam.PolicyDocument({
+            statements: [
+              new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: ["ecs:DescribeTaskDefinition"],
+                resources: ["*"],
+              }),
+              new iam.PolicyStatement({
+                effect: iam.Effect.ALLOW,
+                actions: [
+                  "ecr:BatchCheckLayerAvailability",
+                  "ecr:CompleteLayerUpload",
+                  "ecr:GetAuthorizationToken",
+                  "ecr:InitiateLayerUpload",
+                  "ecr:PutImage",
+                  "ecr:UploadLayerPart",
+                ],
+                resources: [
+                  imageRepo.repositoryArn,
+                  `${imageRepo.repositoryArn}:*`,
+                ],
+              }),
+            ],
+          }),
+        },
+      }),
     });
 
     // Grants CodeBuild project access to pull/push images from/to ECR repo
     imageRepo.grantPullPush(buildImage);
 
-    // Lambda function that triggers CodeBuild image build project
-    const triggerCodeBuild = new lambda.Function(this, "BuildLambda", {
-      architecture: lambda.Architecture.ARM_64,
-      code: lambda.Code.fromAsset("./lambda"),
-      handler: "trigger-build.handler",
-      runtime: lambda.Runtime.NODEJS_18_X,
-      environment: {
-        REGION: process.env.CDK_DEFAULT_REGION!,
-        CODEBUILD_PROJECT_NAME: buildImage.projectName,
-      },
-      // Allows this Lambda function to trigger the buildImage CodeBuild project
-      initialPolicy: [
-        new iam.PolicyStatement({
-          effect: iam.Effect.ALLOW,
-          actions: ["codebuild:StartBuild"],
-          resources: [buildImage.projectArn],
-        }),
-      ],
-    });
-
-    // Triggers a Lambda function using AWS SDK
-    const triggerLambda = new custom.AwsCustomResource(
+    // Triggers a buid AWS SDK
+    const buildTrigger = new custom.AwsCustomResource(
       this,
-      "BuildLambdaTrigger",
+      "CodeBuildStartBuild",
       {
         installLatestAwsSdk: true,
         policy: custom.AwsCustomResourcePolicy.fromStatements([
           new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
-            actions: ["lambda:InvokeFunction"],
-            resources: [triggerCodeBuild.functionArn],
+            actions: ["codebuild:StartBuild"],
+            resources: ["*"],
           }),
         ]),
-        onCreate: {
-          service: "Lambda",
-          action: "invoke",
-          physicalResourceId: custom.PhysicalResourceId.of("id"),
-          parameters: {
-            FunctionName: triggerCodeBuild.functionName,
-            InvocationType: "Event",
-          },
-        },
         onUpdate: {
-          service: "Lambda",
-          action: "invoke",
+          service: "CodeBuild",
+          action: "startBuild",
+
+          physicalResourceId: {
+            id: Date.now().toString(),
+          },
           parameters: {
-            FunctionName: triggerCodeBuild.functionName,
-            InvocationType: "Event",
+            projectName: buildImage.projectName,
           },
         },
       }
@@ -124,7 +144,50 @@ export class CodepipelineBuildDeployStack extends cdk.Stack {
     });
 
     // Deploys the cluster VPC after the initial image build triggers
-    clusterVpc.node.addDependency(triggerLambda);
+    clusterVpc.node.addDependency(buildTrigger);
+
+    // CodeBuild project that builds the Docker image
+    const runDbMigrationProject = new codebuild.Project(
+      this,
+      "RunDbMigration",
+      {
+        buildSpec: codebuild.BuildSpec.fromSourceFilename(
+          "typescript/codepipeline-build-deploy/app/buildspec-migrations.yaml"
+        ),
+        source: codebuild.Source.gitHub({
+          owner: "Vatoth",
+          repo: "aws-cdk-examples",
+        }),
+        environment: {
+          privileged: true,
+          environmentVariables: {},
+        },
+        vpc: clusterVpc,
+      }
+    );
+
+    // Triggers a buid AWS SDK
+    new custom.AwsCustomResource(this, "CodeBuildStartBuildRunMigration", {
+      installLatestAwsSdk: true,
+      policy: custom.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ["codebuild:StartBuild"],
+          resources: ["*"],
+        }),
+      ]),
+      onUpdate: {
+        service: "CodeBuild",
+        action: "startBuild",
+
+        physicalResourceId: {
+          id: Date.now().toString(),
+        },
+        parameters: {
+          projectName: runDbMigrationProject.projectName,
+        },
+      },
+    });
 
     // Creates a new blue Target Group that routes traffic from the public Application Load Balancer (ALB) to the
     // registered targets within the Target Group e.g. (EC2 instances, IP addresses, Lambda functions)
@@ -196,19 +259,20 @@ export class CodepipelineBuildDeployStack extends cdk.Stack {
     // Adds the ECS Fargate service to the ALB target group
     fargateService.attachToApplicationTargetGroup(targetGroupBlue);
 
-    // Creates new pipeline artifacts
-    const sourceArtifact = new pipeline.Artifact("SourceArtifact");
     const buildArtifact = new pipeline.Artifact("BuildArtifact");
 
     // Creates the source stage for CodePipeline
     const sourceStage = {
       stageName: "Source",
       actions: [
-        new pipelineactions.CodeCommitSourceAction({
-          actionName: "CodeCommit",
-          branch: "main",
+        new pipelineactions.CodeStarConnectionsSourceAction({
+          actionName: "GitHub_Source",
+          owner: "Vatoth",
+          repo: "aws-cdk-examples",
+          connectionArn:
+            "arn:aws:codestar-connections:eu-west-1:716658718325:connection/c6e61806-e906-411e-865b-8af922a5568f",
           output: sourceArtifact,
-          repository: codeRepo,
+          branch: "master",
         }),
       ],
     };
@@ -219,9 +283,20 @@ export class CodepipelineBuildDeployStack extends cdk.Stack {
       actions: [
         new pipelineactions.CodeBuildAction({
           actionName: "DockerBuildPush",
-          input: new pipeline.Artifact("SourceArtifact"),
+          input: sourceArtifact,
           project: buildImage,
           outputs: [buildArtifact],
+        }),
+      ],
+    };
+
+    const runMigrationStage = {
+      stageName: "RunDbMigration",
+      actions: [
+        new pipelineactions.CodeBuildAction({
+          actionName: "RunDbMigration",
+          input: sourceArtifact,
+          project: runDbMigrationProject,
         }),
       ],
     };
@@ -242,7 +317,7 @@ export class CodepipelineBuildDeployStack extends cdk.Stack {
     );
 
     // Creates the deploy stage for CodePipeline
-    const deployStage = {
+    const deployStage: pipeline.StageProps = {
       stageName: "Deploy",
       actions: [
         new pipelineactions.CodeDeployEcsDeployAction({
@@ -255,10 +330,46 @@ export class CodepipelineBuildDeployStack extends cdk.Stack {
     };
 
     // Creates an AWS CodePipeline with source, build, and deploy stages
-    new pipeline.Pipeline(this, "BuildDeployPipeline", {
+    const pipelineDeploy = new pipeline.Pipeline(this, "BuildDeployPipeline", {
       pipelineName: "ImageBuildDeployPipeline",
-      stages: [sourceStage, buildStage, deployStage],
+      crossAccountKeys: true,
+      crossRegionReplicationBuckets: {
+        "us-east-1": s3.Bucket.fromBucketName(
+          this,
+          "UsEast1ReplicationBucket",
+          "my-us-east-1-replication-bucket"
+        ),
+        "us-west-1": s3.Bucket.fromBucketName(
+          this,
+          "UsWest1ReplicationBucket",
+          "my-us-west-1-replication-bucket"
+        ),
+        "eu-west-1": new s3.Bucket(this, "eu-west-1"),
+      },
+      reuseCrossRegionSupportStacks: true,
     });
+
+    pipelineDeploy.artifactBucket;
+    pipelineDeploy.addStage(sourceStage);
+    pipelineDeploy.addStage(buildStage);
+    pipelineDeploy.addStage(runMigrationStage);
+    pipelineDeploy.addStage(deployStage);
+
+    const regions = ["us-east-1", "us-west-1", "eu-west-1"];
+    const deployMultiRegionStage = pipelineDeploy.addStage({
+      stageName: "DeployMutilregion",
+    });
+    for (const iterator of regions) {
+      deployMultiRegionStage.addAction(
+        new CodeDeployEcsDeployActionRegion({
+          actionName: `EcsFargateDeploy-${iterator}`,
+          appSpecTemplateInput: buildArtifact,
+          taskDefinitionTemplateInput: buildArtifact,
+          deploymentGroup: deploymentGroup,
+          region: iterator,
+        })
+      );
+    }
 
     // Outputs the ALB public endpoint
     new cdk.CfnOutput(this, "PublicAlbEndpoint", {

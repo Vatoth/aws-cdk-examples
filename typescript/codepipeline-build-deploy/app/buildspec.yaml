@@ -9,18 +9,24 @@ phases:
   build:
     commands:
       - echo Building the Docker image...
+      - cd typescript/codepipeline-build-deploy/app
+      - export IMAGE_TAG=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
       - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
       - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+      - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
   post_build:
     commands:
       - echo Pushing the Docker image...
       - docker push $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:latest
       - echo Container image to be used $REPOSITORY_URI:$IMAGE_TAG
-      - sed -i "s|REPOSITORY_URI|${REPOSITORY_URI}|g" taskdef.json
-      - sed -i "s|IMAGE_TAG|${IMAGE_TAG}|g" taskdef.json
-      - sed -i "s|TASK_ROLE_ARN|${TASK_ROLE_ARN}|g" taskdef.json
-      - sed -i "s|EXECUTION_ROLE_ARN|${EXECUTION_ROLE_ARN}|g" taskdef.json
+      - aws ecs describe-task-definition --task-definition $TASK_DEFINITION_NAME --query taskDefinition > taskdef.json
+      - export IMAGE_URI=$AWS_ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+      - jq --arg IMAGE_URI "$IMAGE_URI" '(.containerDefinitions[] | select(.name=="web") | .image) |=  $IMAGE_URI' taskdef.json > tmp.$$.json && mv tmp.$$.json taskdef.json
       - sed -i "s|TASK_DEFINITION_ARN|${TASK_DEFINITION_ARN}|g" appspec.yaml
+      - cd ../../..
+      - cp typescript/codepipeline-build-deploy/app/appspec.yaml .
+      - cp typescript/codepipeline-build-deploy/app/taskdef.json .
       - cat appspec.yaml && cat taskdef.json
 artifacts:
   files:
